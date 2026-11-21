@@ -227,11 +227,59 @@ private final class WebPageModel: NSObject, WKNavigationDelegate {
     func load(_ request: BrowserRequest) {
         webView.customUserAgent = request.userAgent
         pendingJS = request.js
+        let urlString = Self.canonicalURLString(request.url)
         if let html = request.html, !html.isEmpty {
-            webView.loadHTMLString(html, baseURL: URL(string: request.url))
-        } else if let url = URL(string: request.url) {
+            webView.loadHTMLString(html, baseURL: URL(string: urlString))
+        } else if let url = URL(string: urlString) {
             webView.load(URLRequest(url: url))
         }
+    }
+
+    /// 书源给的地址在交给 WebView 前做两件保守的归一化（与 Legado 的透传行为对齐）：
+    /// 1. 还原 HTML 实体转义（&amp; → &），转义过的地址不是合法 URL；
+    /// 2. 评论页的 source 参数若被重复百分号编码（解码一次后仍是整段 %XX 编码），
+    ///    逐层解开到只编码一次，否则评论页解码一次拿到的是编码串、匹配不到源站。
+    /// 其余参数与地址形态一律原样保留。
+    private static func canonicalURLString(_ string: String) -> String {
+        var result = string.replacingOccurrences(of: "&amp;", with: "&")
+        guard let qIndex = result.firstIndex(of: "?") else { return result }
+        let head = result[...qIndex]
+        let query = result[result.index(after: qIndex)...]
+        var pairs = query.split(separator: "&", omittingEmptySubsequences: false)
+        var changed = false
+        for i in pairs.indices {
+            guard pairs[i].hasPrefix("source=") else { continue }
+            var value = String(pairs[i].dropFirst("source=".count))
+            for _ in 0..<3 {
+                guard value.range(of: "%25", options: .caseInsensitive) != nil,
+                      let decoded = value.removingPercentEncoding,
+                      decoded != value,
+                      isPercentEncodedForm(decoded) else { break }
+                value = decoded
+                changed = true
+            }
+            if changed { pairs[i] = Substring("source=" + value) }
+        }
+        if changed {
+            result = String(head) + pairs.joined(separator: "&")
+        }
+        return result
+    }
+
+    /// 字符串是否基本由 %XX 三字节编码组成（允许少量普通 ASCII 字母数字）
+    private static func isPercentEncodedForm(_ value: String) -> Bool {
+        guard value.contains("%") else { return false }
+        var rest = value
+        var triplets = 0
+        while let idx = rest.range(of: "%")?.lowerBound {
+            let tail = rest[idx...]
+            guard tail.count >= 3,
+                  tail[tail.index(idx, offsetBy: 1)].isHexDigit,
+                  tail[tail.index(idx, offsetBy: 2)].isHexDigit else { return false }
+            triplets += 1
+            rest = String(tail.dropFirst(3))
+        }
+        return triplets > 0 && rest.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) }
     }
 
     nonisolated func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

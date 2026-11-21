@@ -49,17 +49,67 @@ public struct ParagraphComment: Hashable, Sendable {
         for match in attributePattern.matches(in: attributes, range: NSRange(location: 0, length: ns.length)) {
             let name = ns.substring(with: match.range(at: 1)).lowercased()
             let value = match.range(at: 2).location != NSNotFound ? match.range(at: 2) : match.range(at: 3)
-            values[name] = ns.substring(with: value)
+            // 属性值在正文 HTML 里是实体转义过的（如 URL 里的 & 写成 &amp;），
+            // 与 HTML 解析器的行为一致，先反转义再用，否则评论页地址的参数会被 amp; 前缀弄坏
+            values[name] = unescapeEntities(ns.substring(with: value))
         }
         let count = (values["count"] ?? "").trimmingCharacters(in: .whitespaces)
         guard !count.isEmpty, count != "0" else { return nil }
         var action = values["onpress"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         if action?.isEmpty != false, let url = values["ident"], !url.isEmpty {
             // 没经过 paraForiOS 转换的原始标记只有评论页地址
-            let escaped = url.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
+            var target = url
+            // 段落序号若单独放在属性里而地址里没有，补回地址，否则评论页会报缺少 para
+            if target.range(of: "para=") == nil, let para = values["para"] ?? values["data-para"], !para.isEmpty {
+                target += (target.contains("?") ? "&" : "?") + "para=" + para
+            }
+            let escaped = target.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
             action = "java.showReadingBrowser('\(escaped)','段评')"
         }
         return ParagraphComment(count: count, action: action?.isEmpty == true ? nil : action)
+    }
+
+    /// 单遍扫描的 HTML 实体反转义：&amp; &lt; &gt; &quot; &apos; 与数字实体；不认识的原样保留
+    static func unescapeEntities(_ value: String) -> String {
+        guard value.contains("&") else { return value }
+        var out = ""
+        out.reserveCapacity(value.count)
+        var i = value.startIndex
+        while i < value.endIndex {
+            guard value[i] == "&", let semi = value[i...].firstIndex(of: ";"),
+                  value.distance(from: i, to: semi) <= 10 else {
+                out.append(value[i])
+                i = value.index(after: i)
+                continue
+            }
+            let name = String(value[value.index(after: i)..<semi])
+            let replacement: String?
+            switch name {
+            case "amp": replacement = "&"
+            case "lt": replacement = "<"
+            case "gt": replacement = ">"
+            case "quot": replacement = "\""
+            case "apos": replacement = "'"
+            default:
+                if name.hasPrefix("#x") || name.hasPrefix("#X"),
+                   let code = UInt32(name.dropFirst(2), radix: 16), let scalar = Unicode.Scalar(code) {
+                    replacement = String(scalar)
+                } else if name.hasPrefix("#"),
+                          let code = UInt32(name.dropFirst()), let scalar = Unicode.Scalar(code) {
+                    replacement = String(scalar)
+                } else {
+                    replacement = nil
+                }
+            }
+            if let replacement {
+                out += replacement
+                i = value.index(after: semi)
+            } else {
+                out.append(value[i])
+                i = value.index(after: i)
+            }
+        }
+        return out
     }
 }
 
